@@ -1,20 +1,20 @@
-# `duckduckgo-mcp` — MCP server
+# `duck-search-mcp` — MCP server
 
-> **Status:** spec only, not yet implemented. The behaviour described below is the **minimum required to be considered a viable replacement for the current `web_search_basic` tool**. Implementation happens in this repo; integration with the agent happens by editing  `config/mcp.toml` in the `rust-agent` repo. (/home/srlampi/Documents/projects/rust-agent/)
+> **Status:** v0.1 implemented. Speaks MCP 2026-07-28 over Streamable HTTP and stdio, built on FastMCP 4.0.11. The behaviour described below is the contract this server commits to.
 
-A [Model Context Protocol](https://modelcontextprotocol.io/) server that exposes a single free, unauthenticated web-search tool to the `rust-agent` over stdio:
+A [Model Context Protocol](https://modelcontextprotocol.io/specification/2026-07-28) server that exposes a free, unauthenticated web-search tool backed by the DuckDuckGo Instant Answer API. No API key, no account, no rate-limit tier — just one entity-shaped query in and a few short snippets out.
 
 | Tool | Backend | Cost | Best for |
 | --- | --- | --- | --- |
 | `web_search` | DuckDuckGo Instant Answer API | Free, no key | Entity-like queries (people, places, products, standards). Short snippets, no page contents. |
 
-The Rust agent spawns this server as a child process via the official [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) crate, lists the tool, and registers it as a regular `rig::tool::Tool`. From the agent's point of view the tool is indistinguishable from any other.
+| Prompt | Use |
+| --- | --- |
+| `research_entity` | Plan a single `web_search` call for a topic, including the empty-result fallback. |
 
 ---
 
 ## 1. Why this server exists
-
-This server is one of **three** that together replace the current bundled `mcp-servers/web-search/` MCP. The bundle is being split so each backend (DDG, Firecrawl, Tavily) can be enabled, disabled, scaled, and rate-limited independently. The agent code is **unaware** of the split — it still sees one `web_search`-shaped tool per server, with the server-name prefix disambiguating which backend answered.
 
 DDG's Instant Answer API is the free, no-key path. The trade-off is that it is **not** a general web-search index:
 
@@ -22,26 +22,24 @@ DDG's Instant Answer API is the free, no-key path. The trade-off is that it is *
 - It returns an empty 200 for most long-tail / question-shaped queries. That is normal, not an error — see §6.
 - It does not return page contents, only short snippets.
 
-The companion MCPs cover what DDG can't:
-
-- **Tavily** for general question-shaped queries (free tier, agent-tuned).
-- **Firecrawl** for deep content extraction (paid; returns full page
-  bodies as markdown).
-
-Together the three give the agent a layered search strategy where the free path is the default and the paid path is reserved for the few queries that genuinely need it.
+This server does not try to compensate. The companion MCPs that cover the other shapes (general question-shaped search, full-page extraction) are out of scope; agents that need them should call them as separate tools.
 
 ---
 
 ## 2. Protocol contract
 
-The agent (per [`docs/mcp.md`](https://github.com/example/rust-agent/blob/main/docs/mcp.md) §8) requires:
+The server is built on **FastMCP 4.0.11** and targets the **MCP 2026-07-28** revision. It is dual-era out of the box — modern clients negotiate the stateless protocol, legacy clients that send `initialize` still get a working session.
 
-1. Speaks **MCP 2026-07-28** (https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning#protocol-version-negotiation).
-2. Accepts JSON-args objects on `tools/call`.
-3. Returns either `structured_content` (preferred) or at least one text content block.
-4. Advertises at least one tool on `tools/list`.
+| Contract | Value |
+| --- | --- |
+| Protocol revision | `2026-07-28` (advertised via `server/discover`; legacy `initialize` negotiates `2025-11-25`) |
+| Transports | Streamable HTTP at `/mcp` (default), stdio (opt-in via `DUCK_SEARCH_TRANSPORT=stdio`) |
+| Bind address | `127.0.0.1` (loopback only; expose via VS Code port forwarding or ngrok — see `docs/DEPLOYMENT.md`) |
+| Authentication | **None.** Loopback binding is the only access control. Operate behind a trusted tunnel. |
+| Required response fields | `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` headers; tool list advertises `ttlMs`/`cacheScope` |
+| Server features | `tools` (one), `prompts` (one), `resources/templates` (none), `extensions: io.modelcontextprotocol/ui` |
 
-Anything beyond this contract is a server-side decision.
+Any modern MCP client (Claude Desktop, Cursor, opencode, VS Code Copilot Chat) that supports Streamable HTTP can connect to the forwarded URL without code changes.
 
 ---
 
@@ -55,9 +53,10 @@ Anything beyond this contract is a server-side decision.
 {
   "type": "object",
   "properties": {
-    "query":  { "type": "string",  "description": "..." },
-    "count":  { "type": "integer", "minimum": 1, "maximum": 10,
-                "default": 5,     "description": "..." }
+    "query":  { "type": "string",  "description": "...",
+                "minLength": 1 },
+    "count":  { "type": "integer", "description": "...",
+                "default": 5 }
   },
   "required": ["query"],
   "additionalProperties": false
@@ -66,8 +65,8 @@ Anything beyond this contract is a server-side decision.
 
 | Argument | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
-| `query` | string | yes | – | The search query. Trimmed and lowercased before any cache lookup; original query is echoed in the response. |
-| `count` | integer | no | 5 | Max results to return. Clamped to `[1, 10]`. Applied **client-side** — the upstream API has no `count` parameter. |
+| `query` | string | yes | – | The search query. Trimmed before any cache lookup; the trimmed query is echoed in the response. |
+| `count` | integer | no | 5 | Max results to return. **Clamped** to `[1, 10]` server-side (out-of-range values are not rejected, they are clamped). Applied after mapping. |
 
 **Output** (`structured_content`, a JSON object):
 
@@ -88,49 +87,46 @@ Anything beyond this contract is a server-side decision.
 | --- | --- | --- |
 | `query` | string | The query as the server received it (after `trim()`). |
 | `results` | array of `{title, url, snippet}` | Mapped from DDG's `AbstractText` / `RelatedTopics`. See §4. Capped at `count`. |
-| `source` | `"upstream"` or `"cache"` | Tells the model whether this call hit the network. Useful for the model's budgeting, not for end-user display. |
-| `note` | string | Non-empty only on empty results. Tells the model what happened and what to do. |
+| `source` | `"upstream"` or `"cache"` | Tells the model whether this call hit the network. |
+| `note` | string | Non-empty on empty results. Tells the model what happened and what to do. |
 
 **Description (the model reads this verbatim):**
 
-> Free, unauthenticated web search via the DuckDuckGo Instant Answer
-> API. **Reach for this first for entity-like queries** — people,
-> places, products, standards, programming languages, calculations.
-> Returns short snippets; no page contents. For long-tail or
-> question-shaped queries the API often returns an empty response
-> (that's a 200 with `results: []` plus a guidance `note`, **not an
-> error**); rephrase as a canonical topic name at most once, then
-> fall back to the `firecrawl__web_search` or `tavily__web_search`
-> tool. Use `count` to cap the result list (default 5, max 10).
+> Free, unauthenticated web search via the DuckDuckGo Instant Answer API. Reach for this first for entity-like queries — people, places, products, standards, programming languages, calculations. Returns short snippets; no page contents. For long-tail or question-shaped queries the API often returns an empty response (that's a 200 with results: [] plus a guidance note, NOT an error); rephrase as a canonical topic name at most once, then fall back to your own knowledge. Use count to cap the result list (default 5, max 10).
 
 ---
 
 ## 4. Response mapping
 
-The DDG Instant Answer API returns a JSON document with `AbstractText`, `AbstractURL`, `Heading`, `Answer`, and `RelatedTopics`. The mapping mirrors the one in the current `mcp-servers/web-search/server.py` so the agent sees no behavioural change:
+The DDG Instant Answer API returns a JSON document with `AbstractText`, `AbstractURL`, `Heading`, `Answer`, and `RelatedTopics`. The mapping mirrors the legacy web-search MCP so behaviour is unchanged:
 
 1. **The abstract** — `AbstractText` / `AbstractURL` / `Heading`. This is the "real" instant answer (usually a Wikipedia lead paragraph). Used when non-empty.
 2. **The direct answer** — `Answer`, only when there is no abstract (calculations, unit conversions). Often has no URL.
-3. **Related topics** — `RelatedTopics`, flattened: entries with a nested `Topics` array are recursed into. The `Text` field (usually `"<Title> - <one-liner>"`) is split on the first `" - "` to derive the title.
+3. **Related topics** — `RelatedTopics`, flattened: entries with a nested `Topics` array are recursed into. The `Text` field (usually `"<Title> - <one-liner>"`) is split on the first `" - "` to derive the title. Without a separator, the whole `Text` is used for both `title` and `snippet`.
 
 Everything else (`Image`, `Redirect`, `Definition*`, `Type`, `meta`, …) is dropped.
 
-The result list is capped at `count` (clamped to `[1, 10]`). Capping applies **after** mapping, not before.
+The result list is capped at `count` (clamped to `[1, 10]`). A hard ceiling of 10 is applied during mapping as well, so a single `web_search` call never materialises megabytes of related topics.
 
 ---
 
 ## 5. Configuration
 
-All configuration is via environment variables. The Rust agent forwards the relevant ones when it spawns the server via the `env_pass` allow-list in `config/mcp.toml` — see the agent's [`docs/mcp.md`](https://github.com/example/rust-agent/blob/main/docs/mcp.md) §3 for the env-forwarding semantics.
+All configuration is via environment variables. See `.env.example` for the full list with defaults.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `DUCK_SEARCH_TRANSPORT` | `http` | `http` (Streamable HTTP) or `stdio`. |
+| `DUCK_SEARCH_HOST` | `127.0.0.1` | Bind address for HTTP transport. Loopback by design. |
+| `DUCK_SEARCH_PORT` | `8000` | Port for HTTP transport. |
+| `DUCK_SEARCH_PATH` | `/mcp` | URL path for the MCP endpoint. |
 | `DDG_CACHE_DIR` | `./cache/ddg` | On-disk cache directory. Gitignored. |
 | `DDG_CACHE_TTL_SECS` | `86400` | Cache freshness window, seconds. `0` disables the cache. |
 | `DDG_MIN_INTERVAL_MS` | `1100` | Minimum spacing between upstream DDG calls. Concurrent calls queue on a shared mutex. |
-| `MCP_LOG_LEVEL` | `WARNING` | `DEBUG` / `INFO` / `WARNING`. Logs go to **stderr** (stdout is the JSON-RPC stream). |
+| `DDG_HTTP_TIMEOUT_S` | `10` | Upstream HTTP request timeout in seconds. |
+| `MCP_LOG_LEVEL` | `WARNING` | `DEBUG` / `INFO` / `WARNING` / `ERROR`. Logs go to **stderr** (stdout is the JSON-RPC stream). `FASTMCP_LOG_LEVEL` is honoured as a fallback. |
 
-**No API key is required.** The DDG Instant Answer API is free and unauthenticated. The `t=rust-agent` query parameter identifies the consumer to DDG.
+**No API key is required.** The DDG Instant Answer API is free and unauthenticated. The `t=duck-search-mcp` query parameter identifies the consumer to DDG.
 
 ---
 
@@ -145,8 +141,8 @@ A `200 OK` with empty fields (`Heading: ""`, `AbstractText: ""`, `RelatedTopics:
 **Behaviour:**
 
 - The tool **never** errors on an empty response. It returns `results: []` plus the guidance `note` quoted in §3.
-- Non-2xx upstream statuses (real `429`, `5xx`) are surfaced as `is_error: true` with the status text. The model can fall back.
-- A cache miss followed by an empty upstream response **is cached** for the TTL — the next call within 24 h gets the same empty result with zero network traffic. (Polite consumer of a free shared resource.)
+- Non-2xx upstream statuses (real `429`, `5xx`) surface as a `ToolError` with the status text. The model can fall back.
+- A cache miss followed by an empty upstream response **is cached** for the TTL — the next call within 24 h gets the same empty result with zero network traffic.
 
 ---
 
@@ -160,137 +156,130 @@ On-disk TTL cache, key = normalised query (trimmed, inner whitespace collapsed, 
   "results": [ ... ] }
 ```
 
-**Failure semantics:** a missing, stale, corrupt, or unwritable cache entry **never fails the call**. The tool logs a `warn` and degrades to a plain uncached call. The agent's tool-error path is reserved for real upstream failures.
+**Failure semantics:** a missing, stale, corrupt, or unwritable cache entry **never fails the call**. The tool logs a `warn` and degrades to a plain uncached call.
 
 The cache directory is gitignored. Delete any time to force fresh lookups.
 
 ---
 
-## 8. Install / setup
+## 8. Prompts
 
-Match the layout of the existing `mcp-servers/web-search/` so an operator who has set that up before can copy-paste:
+### `research_entity`
+
+A reusable user-message prompt that sets up a single `web_search` call. Args: `topic: str`. Returns a user message that:
+
+1. Tells the model to use `web_search` with a canonical topic name (not a question).
+2. Sets `count=5`.
+3. Defines the empty-result fallback: rephrase once, then fall back to the model's own knowledge and say so.
+
+Registered on the same FastMCP instance as the tool. No extra setup.
+
+---
+
+## 9. Install / setup
 
 ```bash
-cd rust-agent-duckduckgo-mcp
-python3 -m venv .venv      # or: uv venv --python 3.12 .venv
+cd duck-search-mcp
+python3 -m venv .venv           # or: uv venv --python 3.12 .venv
 source .venv/bin/activate
-pip install -e .
+pip install -e .                # or: uv pip install -e .
 ```
 
-**Dependencies (suggested):**
+**Dependencies (pinned, per the project's `pyproject.toml`):**
 
-- `fastmcp>=2.0` — MCP server framework. (The project is `prefecthq/fastmcp` on GitHub but published as `fastmcp` on PyPI; it is the standard framework for building MCP servers in Python and powers most of the Python MCP ecosystem.)
-- `httpx>=0.27` — plain async HTTP client. The DDG Instant Answer API is unauthenticated and JSON-shaped, so no SDK is needed.
+- `fastmcp==4.0.11` — MCP server framework, the standalone PrefectHQ package.
+- `httpx>=0.27` — async HTTP client. The DDG Instant Answer API is unauthenticated and JSON-shaped, so no SDK is needed.
 
-Tested with Python 3.10+. Other interpreters are fine as long as the `rmcp` 0.8 client on the agent side negotiates `2024-11-05` (the version `fastmcp` 2.x ships).
+Tested with Python 3.12. Works on 3.10+.
 
 ---
 
-## 9. Run by hand (for debugging)
+## 10. Run by hand
 
 ```bash
-# The server speaks JSON-RPC over stdio. A blank stdin will let
-# it sit idle; pipe a real `initialize` + `tools/list` exchange
-# to see the registered tool schema.
-python3 -m duckduckgo_mcp
+# HTTP (default) — listen on http://127.0.0.1:8000/mcp
+python3 -m duck_search_mcp
+
+# Stdio — for clients that spawn the server as a child process
+DUCK_SEARCH_TRANSPORT=stdio python3 -m duck_search_mcp
 ```
 
-To smoke-test the tool without the agent, point any MCP client at the running process (e.g. the `mcp-cli` Python package, or `npx @modelcontextprotocol/inspector`). Expected: a `tools/list` response containing exactly one tool, `web_search`, with the schema in §3.
+A blank stdin in stdio mode lets the server sit idle. Point any MCP client (opencode, Claude Desktop, VS Code, Cursor) at the URL or spawn the process; see `docs/DEPLOYMENT.md` for the connection recipes.
 
 ---
 
-## 10. Integration with `rust-agent`
+## 11. Deployment
 
-Add a single entry to `config/mcp.toml` in the `rust-agent` repo:
+Two supported paths. Both rely on the server binding to `127.0.0.1`; neither requires the server itself to know it's being forwarded.
 
-```toml
-[[mcp.servers]]
-name = "duckduckgo"
-command = ["/abs/path/to/rust-agent-duckduckgo-mcp/.venv/bin/python",
-           "/abs/path/to/rust-agent-duckduckgo-mcp/duckduckgo_mcp/__main__.py"]
-env_pass = ["PATH", "HOME"]   # no API keys needed
-enabled = true
-```
+1. **VS Code "Forward a Port"** (recommended). Open the Ports panel, forward `8000`, copy the URL, point your client at `<forwarded-url>/mcp`. The tunnel runs through Microsoft's relay — no public hostname to block.
+2. **ngrok** (fallback). `ngrok http 8000`, point your client at `<ngrok-url>/mcp`. Free-tier URLs are publicly enumerable; corporate networks often block them.
 
-Restart the agent. The model now sees the tool under its qualified name `duckduckgo__web_search`. To temporarily disable DDG without removing the entry, set `enabled = false` (the agent parses and validates the entry but skips spawning).
-
-The default `web-search` MCP entry in `config/mcp.toml` (the bundled DDG + Firecrawl one) **must be removed or disabled** before the new DDG entry is enabled, or the agent will register two `web_search` shaped tools and the model will be confused about which to use.
+For both, the server is started with `python3 -m duck_search_mcp`. No auth is configured — the loopback bind + tunnel auth is the access control. See `docs/DEPLOYMENT.md` for the full step-by-step.
 
 ---
 
-## 11. Failure modes and how the model reacts
+## 12. Failure modes
 
 | What goes wrong | What the tool does | What the model sees |
 | --- | --- | --- |
 | Upstream returns `200` with empty fields | Returns `results: []` + the guidance `note` | A normal success, empty results, with an instruction to rephrase once or fall back. |
-| Upstream returns non-2xx (`429`, `5xx`) | `is_error: true` with the status text | A clear HTTP error. The model retries with the `tavily__web_search` tool, or moves on. |
+| Upstream returns non-2xx (`429`, `5xx`) | Raises `ToolError` with the status text | A clear HTTP error. The model retries with another tool, or moves on. |
 | Upstream throttling (empty `200`s) | Cached entry still serves; misses return the empty-result shape | Same as the first row — the model only sees the standard shape. |
 | Cache directory missing / unwritable | Logs `warn`; falls through to a plain uncached call | The tool still works, just slower on repeat queries. |
 | Cache file corrupt | Logs `warn`; falls through to a fresh upstream call | Same. |
 | DDG endpoint changes shape | The mapper may return `results: []` for previously-working queries | Empty results with the standard `note`. Operators notice; the schema-mapping code is the only thing to update. |
-| MCP server child dies | The `rmcp` client surfaces an `ErrorData`; the tool returns a protocol-level error | A connection error. The supervisor loop's standard "two empty iterations" rule nudges the model. |
-| Server didn't spawn (venv missing) | `build_agent` returns an error at agent startup | The agent refuses to start with a clear message naming the server and the command. **No silent fallback** — the design choice documented in `docs/mcp.md` §7. |
+| Server didn't start (port in use, venv missing) | Process exits with a clear log line on stderr | The client gets a connection error. No silent fallback. |
+| Foreign `Origin` header | Accepted when the server is bound to `127.0.0.1` (DNS rebinding isn't possible) | The probe flags this as a WARN; see `docs/DEPLOYMENT.md` for when to enable `http_host_origin_protection`. |
 
 ---
 
-## 12. Context-budget protection
+## 13. Acceptance criteria
 
-The DDG tool's per-result content is small (a snippet, not a page body), so a single call with `count=10` is on the order of a few hundred tokens. No per-result markdown cap is required. The agent's existing `RUST_AGENT_CONTEXT_PRESSURE_THRESHOLD_TOKENS` guard (default 800k, sized for MiniMax-M3's 1M-token window) covers the multi-call case end-to-end.
+The implementation is "good enough to ship" when **all** of the following hold:
 
----
-
-## 13. Acceptance criteria (minimum viable)
-
-The implementation is "good enough to unblock the agent" when **all** of the following hold:
-
-1. `pip install -e .` from a clean checkout succeeds on Python 3.10+.
-2. `python3 -m duckduckgo_mcp` starts and responds to a manual`initialize` + `tools/list` JSON-RPC exchange (smoke test).
-3. The advertised tool is exactly `web_search`, with the input schema and description in §3.
-4. A live call against the DDG Instant Answer API with a canonical entity query (`"Rust programming language"`, `"HTTP 418"`, `"Isaac Newton"`) returns at least one result.
-5. A live call with a known-empty long-tail query (the one in `tests/mcp.rs::basic_search_long_tail_returns_empty_with_note`) returns `results: []` plus a non-empty `note`.
-6. Two identical calls within the cache TTL produce a second response with `source: "cache"` and no upstream traffic.
-7. Spawning this server from the agent's `config/mcp.toml` succeeds, the model sees the tool as `duckduckgo__web_search`, and a one-shot request (`cargo run -- run --request "What is the capital of Japan?"`) triggers at least one call to it.
+1. `pip install -e .` from a clean checkout succeeds on Python 3.10+. ✅
+2. `python3 -m duck_search_mcp` starts on `http://127.0.0.1:8000/mcp` and answers `server/discover` with `supportedVersions: ["2026-07-28"]`. ✅
+3. The advertised tool is exactly `web_search`, with the input schema and description in §3. ✅
+4. A live call against the DDG Instant Answer API with a canonical entity query (`"Rust programming language"`, `"HTTP 418"`, `"Isaac Newton"`) returns at least one result. ✅
+5. A live call with a known-empty long-tail query returns `results: []` plus a non-empty `note`. ✅
+6. Two identical calls within the cache TTL produce a second response with `source: "cache"` and no upstream traffic. ✅
+7. The wire probe (`scripts/probe_mcp_server.py`) reports 0 failures against the live server. ✅
+8. The in-process test suite (`pytest`) reports 0 failures in both `mode="auto"` and `mode="legacy"`. ✅
 
 ---
 
 ## 14. Test plan
 
-Unit tests (hermetic, no network):
+Unit tests (hermetic, no network) live in `tests/`:
 
-- `cache_round_trip_serves_second_call_from_disk` — write a cache entry, read it back, assert `source: "cache"`.
-- `cache_corrupt_file_falls_through_to_upstream` — write garbage to a cache file, assert the call still succeeds (with a `warn` log).
-- `count_is_clamped_to_1_through_10` — assert `count=0` clamps to `1`, `count=11` clamps to `10`, `count=None` (omitted) defaults to `5`.
-- `query_is_trimmed_and_echoed` — assert `"  hello  "` is stored as `"hello"` and returned in the `query` field.
-- `empty_ddg_response_returns_empty_results_with_note` — feed a canned empty `200` response, assert the shape.
+- `test_normalize.py` — query normalisation, slug, FNV-1a 64-bit hash.
+- `test_cache.py` — round trip, normalisation equivalence, stale entry, corrupt file, unwritable dir, atomic write.
+- `test_rate_limit.py` — disabled at 0 ms, serial waits spaced, concurrent waits queued.
+- `test_ddg_mapping.py` — empty payload, abstract, answer, related topics, recursion, hard cap, specials drop.
+- `test_server.py` — tool/prompt advertisement, basic search, trim+echo, count clamp, empty result, cache second call, upstream error, both client modes.
+- `test_server_integration.py` — real DDG calls, skipped unless `DUCK_SEARCH_NETWORK_TESTS=1`.
 
-Integration tests (network, gated on the venv existing, mirroring `tests/mcp.rs` in the agent)
+End-to-end (manual):
 
-- `mcp_server_advertises_web_search` — handshake, `tools/list`, assert exactly one tool named `web_search`.
-- `basic_search_returns_structured_results` — call `"Rust programming language"`, assert `results.len() >= 1` and `source in {"upstream", "cache"}`.
-- `basic_search_long_tail_returns_empty_with_note` — call the known-empty long-tail query, assert `results == []` and `note != ""`.
-- `second_call_within_ttl_serves_from_cache` — call twice, assert the second has `source: "cache"`.
-
-End-to-end (manual, smoke checklist from `docs/testing.md`):
-
-- `cargo run -- run --request "What is the capital of Japan?"` — assert at least one `duckduckgo__web_search` tool call in the log, and a non-empty final reply.
+- `python3 -m duck_search_mcp` then connect from any modern MCP client (opencode, VS Code, Claude Desktop, Cursor) and confirm `web_search` appears and returns results.
 
 ---
 
 ## 15. Out of scope for v0.1
 
 - **No other DDG endpoints.** The Images API, the Video API, etc. are not exposed. Only the Instant Answer API.
-- **No general web-search index.** The Instant Answer API is an entity-lookup API, not a web index. Long-tail queries are out of scope for this server; the agent should fall back to `tavily__web_search` or `firecrawl__web_search`.
+- **No general web-search index.** Long-tail queries are out of scope; the agent should fall back to its own knowledge or a different tool.
 - **No rate-limit-aware retries.** DDG's "soft 429" (empty `200`s) is handled by the cache; the tool does not implement explicit backoff. Operators monitor logs.
 - **No parallel upstream calls.** A single in-flight upstream request is the unit. The shared `min_interval_ms` mutex serialises them.
-- **No HTTP transport.** Stdio only, per `docs/mcp.md` §6. When the agent's HTTP transport lands, this server may be wrapped behind a small stdio-to-HTTP shim, or a parallel HTTP entry point can be added later — out of scope for v0.1.
+- **No authentication.** The server is open by design; access control relies on the loopback bind plus whatever the user puts in front (VS Code tunnel, ngrok, etc.).
 
 ---
 
 ## 16. References
 
-- Agent integration overview: [`docs/mcp.md`](https://github.com/example/rust-agent/blob/main/docs/mcp.md) in the `rust-agent` repo.
-- Agent's `tools::mcp` module-level reference: [`docs/modules/tools-mcp.md`](https://github.com/example/rust-agent/blob/main/docs/modules/tools-mcp.md).
-- Existing bundled DDG + Firecrawl MCP (split source for this work): [`mcp-servers/web-search/`](https://github.com/example/rust-agent/tree/main/mcp-servers/web-search) in the `rust-agent` repo — specifically `server.py` (the `web_search_basic` / `_do_ddg_basic_search` path) and `docs/duckduckgo-api.md` (the API contract and empty-response semantics). When the bundled MCP is retired, that document moves here.
-- DDG Instant Answer API overview: <https://duckduckgo.com/duckduckgo-help-pages/settings/params> and <https://api.duckduckgo.com/api>.
-- MCP specification: <https://modelcontextprotocol.io>.
-- `fastmcp` (Python MCP server framework): <https://github.com/PrefectHQ/fastmcp>.
+- MCP specification (target revision): https://modelcontextprotocol.io/specification/2026-07-28/
+- MCP `server/discover`: https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/discover
+- DDG Instant Answer API overview: https://duckduckgo.com/duckduckgo-help-pages/settings/params and https://api.duckduckgo.com/api.
+- FastMCP (Python MCP server framework): https://github.com/PrefectHQ/fastmcp and https://gofastmcp.com.
+- VS Code Streamable HTTP support: https://code.visualstudio.com/api/extension-guides/ai/mcp

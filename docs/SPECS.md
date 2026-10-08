@@ -33,7 +33,7 @@ The server is built on **FastMCP 4.0.11** and targets the **MCP 2026-07-28** rev
 | Contract | Value |
 | --- | --- |
 | Protocol revision | `2026-07-28` (advertised via `server/discover`; legacy `initialize` negotiates `2025-11-25`) |
-| Transports | Streamable HTTP at `/mcp` (default), stdio (opt-in via `DUCK_SEARCH_TRANSPORT=stdio`) |
+| Transports | Streamable HTTP at `/mcp` (default), stdio (opt-in via `DUCK_SEARCH_TRANSPORT=stdio`). A `GET /health` liveness probe is also served from the same HTTP listener (returns `200 OK` with `{"status": "ok"}`). |
 | Bind address | `127.0.0.1` (loopback only; expose via VS Code port forwarding or ngrok — see `docs/DEPLOYMENT.md`) |
 | Authentication | **None.** Loopback binding is the only access control. Operate behind a trusted tunnel. |
 | Required response fields | `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` headers; tool list advertises `ttlMs`/`cacheScope` |

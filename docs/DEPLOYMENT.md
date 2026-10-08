@@ -27,7 +27,7 @@ INFO  Starting MCP server 'duck-search-mcp' with transport 'http' on http://127.
 INFO  Uvicorn running on http://127.0.0.1:8000
 ```
 
-The server is now reachable at `http://127.0.0.1:8000/mcp` on the local machine.
+The server is now reachable at `http://127.0.0.1:8000/mcp` on the local machine. A liveness probe is also available at `http://127.0.0.1:8000/health` (returns `200 OK` with `{"status": "ok"}`) — this is what VS Code's port-forward tunnel hits to verify the local port is alive.
 
 ### 1.2 Forward the port
 

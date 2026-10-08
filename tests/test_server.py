@@ -203,3 +203,13 @@ async def test_legacy_era_also_calls_the_tool(fake_ddg):
         sc = result.structured_content
         assert sc["query"] == "Rust"
         assert sc["note"] == EMPTY_NOTE
+
+
+async def test_health_endpoint_returns_200():
+    # The /health route is registered on the ASGI app; we hit it through the
+    # underlying Starlette client (httpx.AsyncClient(transport=ASGITransport(app=mcp.http_app()))).
+    from starlette.testclient import TestClient
+    client = TestClient(mcp.http_app())
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}

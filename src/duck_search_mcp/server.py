@@ -18,6 +18,8 @@ import httpx
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import Field
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
 
 from .cache import DiskCache
 from .ddg import EMPTY_NOTE, fetch_ddg, map_ddg_response
@@ -69,6 +71,17 @@ mcp = FastMCP(
 )
 
 register_prompts(mcp)
+
+
+@mcp.custom_route(path="/health", methods=["GET"], name="health")
+async def health(_: Request) -> Response:
+    """Liveness probe.
+
+    Returns 200 OK for any GET. Used by VS Code's port-forward tunnel and any
+    external monitor. Does not exercise the cache or the upstream; a 200 only
+    means the ASGI app is up and the lifespan has started.
+    """
+    return JSONResponse({"status": "ok"})
 
 
 @mcp.tool(
